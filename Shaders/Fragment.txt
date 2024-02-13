@@ -1,0 +1,368 @@
+#version 330 core
+
+uniform sampler2D tex;
+uniform sampler2D Concrete;
+uniform float Time;
+uniform vec2 Resolution;
+
+uniform vec2 Rotation;
+uniform vec3 Position;
+
+in vec2 fragCoord;
+out vec4 fragColor;
+
+// Define constant properties of the shader
+const float Fov = 1.0;
+const float FogDensity = 0.01; // 0.008;
+
+const int MaxMarches = 256;
+const float MaxDistance = 500.0;
+const float MinDistance = 0.001;
+
+// Define struct for a point light
+struct PointLight
+{
+    vec3 Position;
+    vec3 Color;
+    float Intensity;
+};
+
+// Define struct for a material
+struct Material
+{
+    vec3 Color;
+    vec3 SpecularColor;
+};
+
+// Function to texture a surface using triplaner mapping
+vec3 textureMapping(sampler2D Texture, vec3 Point, vec3 SurfaceNormal)
+{
+    SurfaceNormal = abs(SurfaceNormal);
+    
+    return (texture(Texture, Point.xy * 0.5 + 0.5) * SurfaceNormal.z +
+            texture(Texture, Point.xz * 0.5 + 0.5) * SurfaceNormal.y +
+            texture(Texture, Point.yz * 0.5 + 0.5) * SurfaceNormal.x).rgb;
+}
+
+// 2D roation for objects
+mat2 rot2D(float Angle)
+{
+    float Sin = sin(Angle);
+    float Cos = cos(Angle);
+    
+    return mat2(Cos, -Sin, Sin, Cos);
+}
+
+// Min function for vec2 format where x is distance
+vec2 minVec2(vec2 Obj1, vec2 Obj2)
+{
+    return (Obj1.x < Obj2.x) ? Obj1 : Obj2;
+}
+
+// Max function for vec2 format where x is distance
+vec2 maxVec2(vec2 Obj1, vec2 Obj2)
+{
+    return (Obj1.x > Obj2.x) ? Obj1 : Obj2;
+}
+
+// Blending function
+vec2 smin(vec2 Obj1, vec2 Obj2, float Smoothing)
+{
+    float H = max(Smoothing - abs(Obj1.x - Obj2.x), 0.0) / Smoothing;
+    float Distance = min(Obj1.x, Obj2.x) - H * H * H * Smoothing * (1.0 / 6.0);
+    return vec2(Distance, min(Obj1.x, Obj2.x) == Obj1.x ? Obj1.y : Obj2.y);
+}
+
+
+// SDF of a sphere
+float sdSphere(vec3 Point, float Radius)
+{
+    return length(Point) - Radius;
+}
+
+// SDF of a cube
+float sdCube(vec3 Point, vec3 Dimensions)
+{
+    vec3 Q = abs(Point) - Dimensions;
+    return length(max(Q, 0.0)) + min(max(Q.x, max(Q.y, Q.z)), 0.0);
+}
+
+// Distance to nearest object in the scene
+vec2 map(vec3 Point)
+{
+    //vec3 SpherePos = vec3(-1, 0, 0); // Sphere position
+    //float SphereDistance = sdSphere(Point - SpherePos, 1.0); // Sphere SDF
+    //vec2 Sphere = vec2(SphereDistance, 1.0); // Distance and ID
+    
+    //vec3 CubePos = vec3(0, 0, 0); // Sphere position
+    //float CubeDistance = sdCube(Point - CubePos, vec3(2.0, 2.5, 2.0)); // Cube SDF
+    //vec2 Cube = vec2(CubeDistance, 2.0); // Distance and ID
+
+    float TunnelADistance = sdCube(Point - vec3(0, 0, 15.0), vec3(1.0, 1.01, 7.51)); // Cube SDF
+    float TunnelBDistance = sdCube(Point - vec3(6.0, 0, 15.0), vec3(5.01, 1.01, 1.0)); // Cube SDF
+
+    float RoomADistance = sdCube(Point - vec3(0.0, 6.5, 30.0), vec3(7.51, 8.5, 7.51)); // Cube SDF
+    float RoomBDistance = sdCube(Point - vec3(16.0, 0, 15.0), vec3(5.01, 1.01, 5.01)); // Cube SDF
+
+    vec2 Tunnel = vec2(-min(RoomBDistance, min(RoomADistance, min(TunnelBDistance, TunnelADistance))), 4.0); // Distance and ID
+
+    vec3 PillarPos = abs(Point);
+    PillarPos.xz = mod(PillarPos.xz, 2.5) - 1.25; // For repeated pillars
+    float PillarDistance = sdCube(PillarPos, vec3(0.25, 1.01, 0.25)); // Cube SDF
+    vec2 Pillar = (Point.z < 7.5 && Point.x < 7.5) ? vec2(PillarDistance, 1.0) : vec2(100, 1.0); // Distance and ID
+
+    float WallXDistance = min(7.5 - Point.x, Point.x + 7.5); // Wall1 SDF
+    float WallZDistance = min(7.5 - Point.z, Point.z + 7.5); // Wall3 SDF
+    vec2 Walls = vec2(min(WallXDistance, WallZDistance), 4.0); // Distance and ID
+
+    vec2 RoofGround = vec2(min((Point.z < 22.49) ? 1.0 - Point.y : 14.0 - Point.y, Point.y + 1.0), 3.0); // Distance and ID
+    
+    // Closest distance to scene aka object on top
+    return minVec2(RoofGround, minVec2(maxVec2(Walls, Tunnel), Pillar));
+}
+
+// March a ray to its end
+vec2 rayMarch(vec3 RayOrigin, vec3 RayDirection)
+{
+    float DistanceTraveled = 0.0; // Total distance traveled by ray
+    float MaterialIndex = 0.0; // Index of the material of closest object
+    
+    for (int i = 0; i < MaxMarches; i++)
+    {
+        vec3 PositionOnRay = RayOrigin + RayDirection * DistanceTraveled; // Position along the ray
+
+        vec2 ObjectInformation = map(PositionOnRay); // Current distance to the scene and material ID
+
+        DistanceTraveled += ObjectInformation.x; // March the ray forward
+        MaterialIndex = ObjectInformation.y; // Set material index
+        
+        if (ObjectInformation.x < MinDistance || DistanceTraveled > MaxDistance) break; // Stop loop in exit cases
+    }
+    
+    return vec2(DistanceTraveled, MaterialIndex);
+}
+
+// Get normal vector at any point
+vec3 getNormal(vec3 Point)
+{
+    float DistanceToScene = map(Point).x;
+    
+    vec2 Res = vec2(MinDistance, 0); // Resolution
+    vec3 Normal = DistanceToScene - vec3(map(Point - Res.xyy).x, map(Point - Res.yxy).x, map(Point - Res.yyx).x);
+    
+    return normalize(Normal);
+}
+
+// Get material based on ID
+Material getMaterial(vec3 Point, float MaterialID, vec3 SurfaceNormal)
+{
+    Material Colors;
+    
+    switch (int(MaterialID))
+    {
+        case 1:
+            Colors.Color = textureMapping(Concrete, Point * (1.0 / vec3(0.25, 1.0, 0.25)), SurfaceNormal);
+            Colors.SpecularColor = vec3(0.0);
+            break;
+        
+        case 2:
+            Colors.Color = vec3(0.0, 1.0, 0.0);
+            Colors.SpecularColor = vec3(0.5);
+            break;
+        
+        case 3:
+            Colors.Color = vec3(0.2 + 0.4 * mod(floor(Point.x) + floor(Point.z), 2.0));
+            Colors.SpecularColor = vec3(0.5);
+            break;
+
+        case 4:
+            Colors.Color = vec3(0.5, 0.5, 0.5);
+            Colors.SpecularColor = vec3(0.5);
+            break;
+        
+        //case 4: // EG for texture
+        //Colors.Color = textureMapping(TextureName, Point * (1.0 / ObjectSize), SurfaceNormal); break;
+        // Also make sure to apply any translations to Point as you did to the object
+        // And to texture circle extra steps are needed consult video
+    }
+    
+    return Colors;
+}
+
+// Get light properties based on ID
+PointLight getLight(float LightID)
+{
+    PointLight Light;
+    
+    switch (int(LightID))
+    {
+        case 1:
+            Light.Position = vec3(0.0, 0.0, 0.0);
+            Light.Color = vec3(1.0, 1.0, 1.0);
+            Light.Intensity = 5.0;
+            break;
+        
+        case 2:
+            Light.Position = vec3(0.0, 0.0, 15.0);
+            Light.Color = vec3(1.0, 1.0, 1.0);
+            Light.Intensity = 5.0;
+            break;
+
+        case 3:
+            Light.Position = vec3(-2.0, 3.0, 0.0);
+            Light.Color = vec3(1.0, 0.0, 1.0);
+            Light.Intensity = 5.0;
+            break;
+    }
+    
+    return Light; // Color, Intensity, Position
+}
+
+// Caculate the color for a pixel based on lighting
+vec3 Lighting(vec3 Point, float MaterialID, vec3 Direction, int LightCount)
+{
+    vec3 FinalColor = vec3(0.0);
+    
+    // Direction vectors
+    vec3 SurfaceNormal = getNormal(Point);
+    vec3 InverseRayDirection = -Direction; // Inverse ray vector used for specular reflection
+
+    Material Colors = getMaterial(Point, MaterialID, SurfaceNormal); // Material colors
+    vec3 Color = Colors.Color; // Material color
+    
+    // Ambient Occlusion // // // // // // // // //
+
+    float Occlusion = 0.0;
+    float Weight = 1.0;
+
+    for (int i = 0; i < 8; i++)
+    {
+        float PositionOnRay = 0.01 + 0.02 * float(i * i); // Position along the ray
+        float DistanceToScene = map(Point + SurfaceNormal * PositionOnRay).x; // Current distance to the scene
+
+        Occlusion += (PositionOnRay - DistanceToScene) * Weight;
+        Weight *= 0.85;
+    }
+
+    Occlusion = 1.0 - clamp(0.6 * Occlusion, 0.0, 1.0);
+
+    // // // // // // // // // // // // // // // //
+        
+    for (int i = 0; i < LightCount; i++)
+    {
+        PointLight Light = getLight(float(i + 1)); // Get light properties
+        
+        // Set position of light
+        vec3 LightPos = Light.Position;
+        LightPos.xz += vec2(sin(Time), cos(Time)) * 0.75;
+
+        // Distance from point to light
+        float Distance = length(Point - LightPos);
+
+        // Diffuse lighting for each pixel
+        float DistanceIntensity = 1.0 / pow(Distance, 2.0) * Light.Intensity;
+        
+        if (DistanceIntensity > 0.01)
+        {
+            // Direction vectors
+            vec3 DirectionToLight = normalize(LightPos - Point);
+            vec3 ReflectionVector = reflect(-DirectionToLight, SurfaceNormal); // Vector of refelcted light
+
+            // Diffuse lighting for each pixel
+            float AngleIntensity = clamp(dot(SurfaceNormal, DirectionToLight), 0.0, 1.0);
+            vec3 Diffuse = Color * DistanceIntensity * AngleIntensity; // Replace 5.0 with intensity
+
+            // Specular Refelctions
+            vec3 SpecularColor = Colors.SpecularColor;
+            vec3 Specular = SpecularColor * pow(clamp(dot(ReflectionVector, InverseRayDirection), 0.0, 1.0), 10.0)  * DistanceIntensity;
+
+            // Calculate Shadows // // // // // // // // //
+
+            float InShadow = 1.0;
+            float LightSize = 0.03;
+
+            vec3 RayOrigin = Point + SurfaceNormal * 0.02; // Ray origin
+            float DistanceTraveled = 0.01; // Total distance traveled by ray
+
+            for (int i = 0; i < MaxMarches; i++)
+            {
+                vec3 PositionOnRay = RayOrigin + DirectionToLight * DistanceTraveled; // Position along the ray
+                float DistanceToScene = map(PositionOnRay).x; // Current distance to the scene
+
+                //InShadow = min(InShadow, DistanceToScene / (DistanceTraveled * LightSize)); // Get how far in shadow it is
+                DistanceTraveled += DistanceToScene; // March the ray
+
+                if (DistanceToScene < 0.00001)
+                {
+                    InShadow = 0.0;
+                }
+
+                if (DistanceToScene < 0.00001 || DistanceTraveled > Distance) break; // Stop loop in exit cases
+            }
+
+            InShadow = clamp(InShadow, 0.0, 1.0);
+
+            // // // // // // // // // // // // // // // //
+
+            vec3 ColorReflected = 0.005 * Color * clamp(dot(SurfaceNormal, -DirectionToLight), 0.0, 1.0);
+
+            FinalColor += (ColorReflected * Occlusion + (Specular * Occlusion + Diffuse) * InShadow) * Light.Color;
+        }
+    }
+    
+    vec3 AmbientLight = Color * 0.005;
+    
+    return FinalColor + AmbientLight * Occlusion;
+}
+
+void main()
+{
+    // Get uv coods centered and scaled for aspect ratio
+    vec2 uv = ((fragCoord - .5) * Resolution.xy) / Resolution.y;
+    
+    // Initialization // // // // // // // // // //
+    
+    vec3 RayOrigin = Position; // Ray origin
+    vec3 RayDirection = normalize(vec3(uv * Fov, 1)); // Ray direction scale uv for FOV
+    vec3 Color = vec3(0.0, 0.0, 0.0); // Final pixel color
+
+    // Camera rotation
+    RayDirection.yz *= rot2D(Rotation.y); // Vecticle roation
+    RayDirection.xz *= rot2D(Rotation.x); // Horizontal rotation
+    
+    // Raymarching // // // // // // // // // // //
+    
+    vec2 RayInformation = rayMarch(RayOrigin, RayDirection);
+    vec3 FinalPosition = RayOrigin + RayDirection * RayInformation.x;
+    
+    // Coloring // // // // // // // // // // // //
+    
+    if (RayInformation.x < MaxDistance) // Check if ray hit something
+    {
+        vec3 DiffuseLighting = Lighting(FinalPosition, RayInformation.y, RayDirection, 2); // Get diffuse lighting
+        
+        DiffuseLighting = mix(DiffuseLighting, vec3(0.25), 1.0 - exp(-FogDensity * pow(RayInformation.x, 2.0))); // Apply fog
+    
+        Color = DiffuseLighting; // Color for diffuse lighting
+    }
+    
+    else // If ray shot of into sky
+    {
+        vec3 BackgroundColor = vec3(0.5, 0.8, 0.9) - max(0.95 * RayDirection.y, 0.0); // Color darkens as it gets higher
+        
+        BackgroundColor = mix(BackgroundColor, vec3(0.25), 1.0 - exp(-FogDensity * pow(RayInformation.x, 2.0))); // Apply fog
+        
+        Color = BackgroundColor; // Color for sky
+    }
+    
+    Color = pow(Color, vec3(0.4545)); // Gamma correction
+    
+    vec3 Pygame = texture(tex, fragCoord).rgb;
+
+    if (Pygame != vec3(1.0, 0.0, 0.0))
+    {
+        Color = Pygame + Color * 0.25;
+    }
+
+    fragColor = vec4(Color, 1); // Output color to screen
+}
