@@ -1,2 +1,2 @@
 # Cube-Game-FPS
-A 3D FPS written in python using modernGL
+A 3D FPS written in python using modernGL. This is my current project and is no where near finshed yet however my current progress is here, this is a simple fps shooter the graphics will mostly be rendered using a ray marching, as i found the method interesting, and all the logic for the game will in the python files.
